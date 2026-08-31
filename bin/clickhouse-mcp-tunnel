@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Run the ClickHouse MCP server against an endpoint reachable only inside a VPC.
+#
+# Opens (or reuses) the SSM tunnel ch-tunnel manages and points the server at
+# localhost, passing the real endpoint hostname as CLICKHOUSE_SERVER_HOST_NAME so
+# TLS SNI still resolves. Credentials come from the login keychain, keeping them
+# out of the MCP client's config file.
+#
+#   clickhouse-mcp-tunnel --set-credentials <profile>
+#   clickhouse-mcp-tunnel --check <profile>
+#   clickhouse-mcp-tunnel <profile>            run the server (stdio)
+
+set -uo pipefail
+
+# MCP servers start from a minimal environment; uv, aws and the SSM plugin all
+# live outside it.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+# Resolve our own location through any symlink so lib/ is found when this script
+# is linked into ~/.local/bin.
+_src="$0"
+while [ -L "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  case "$_src" in /*) ;; *) _src="$_dir/$_src" ;; esac
+done
+_self_dir="$(cd -P "$(dirname "$_src")" && pwd)"
+. "$_self_dir/../lib/common.sh"
+
+action=serve
+case "${1:-}" in
+  --set-credentials|--check) action="${1#--}"; shift ;;
+  -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
+cmt_load_profile "${1:?usage: clickhouse-mcp-tunnel [--set-credentials|--check] <profile>}"
+TUNNEL="$_self_dir/ch-tunnel"
+
+# Ask through whichever channel this shell actually has. A terminal gets `read`;
+# anything else (an MCP client's prompt, a launchd job) gets a native dialog on
+# macOS, so the password never lands in shell history or a transcript.
+# CH_USER/CH_PASS override both for scripted setup.
+_ask() {
+  local prompt="$1" hidden="$2" value extra=""
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf '%s: ' "$prompt" >&2
+    if [ "$hidden" = yes ]; then read -rs value; echo >&2; else read -r value; fi
+  elif command -v osascript >/dev/null 2>&1; then
+    [ "$hidden" = yes ] && extra="with hidden answer"
+    value="$(osascript \
+      -e "display dialog \"${prompt}:\" default answer \"\" ${extra} with title \"ClickHouse ${CMT_PROFILE}\"" \
+      -e 'text returned of result' 2>/dev/null)"
+  fi
+  printf '%s' "$value"
+}
+
+_keychain_user() {
+  security find-generic-password -s "$KEYCHAIN_SERVICE" 2>/dev/null \
+    | awk -F'"' '/"acct"<blob>=/{print $4}'
+}
+_keychain_pass() { security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null; }
+
+if [ "$action" = set-credentials ]; then
+  user="${CH_USER:-$(_ask 'ClickHouse username' no)}"
+  pass="${CH_PASS:-$(_ask 'ClickHouse password' yes)}"
+  [ -n "$user" ] && [ -n "$pass" ] \
+    || die "username and password are both required; nothing stored."
+  security add-generic-password -a "$user" -s "$KEYCHAIN_SERVICE" -w "$pass" -U \
+    && echo "stored '$user' in keychain item '$KEYCHAIN_SERVICE'" >&2
+  exit $?
+fi
+
+user="$(_keychain_user)"; pass="$(_keychain_pass)"
+if [ -z "$user" ] || [ -z "$pass" ]; then
+  echo "${0##*/}: no keychain item '$KEYCHAIN_SERVICE'." >&2
+  echo "${0##*/}: store credentials with: ${0##*/} --set-credentials $CMT_PROFILE" >&2
+  exit 1
+fi
+
+# Prove the stored credential authenticates, rather than finding out through a
+# failing tool call inside the MCP client.
+if [ "$action" = check ]; then
+  "$TUNNEL" --ensure "$CMT_PROFILE" >&2 || exit 1
+  host="$("$TUNNEL" --host "$CMT_PROFILE")"
+  echo "user '$user' -> ${host}:${REMOTE_PORT} via localhost:${LOCAL_PORT}" >&2
+  # The HTTP interface takes one statement per request.
+  _q() {
+    curl -sS -m 20 --resolve "${host}:${LOCAL_PORT}:127.0.0.1" "https://${host}:${LOCAL_PORT}/" \
+      -H "X-ClickHouse-User: ${user}" -H "X-ClickHouse-Key: ${pass}" --data-binary "$1"
+  }
+  _q 'SELECT currentUser() AS user, version() AS version FORMAT TSVWithNames' || exit 1
+  echo "-- databases --"
+  _q 'SHOW DATABASES' || exit 1
+  exit 0
+fi
+
+# From here on stdout is the JSON-RPC channel. MCP clients withhold server
+# stderr, so keep our own copy of it and let nothing else near stdout.
+exec 2>>"$CMT_STATE_DIR/$CMT_PROFILE-mcp.log"
+echo "--- $(date '+%Y-%m-%d %H:%M:%S') pid=$$ profile=$CMT_PROFILE ---" >&2
+
+# Warn rather than exit: the server is useful the moment the tunnel appears, so a
+# missing tunnel should not cost an MCP client restart.
+"$TUNNEL" --ensure "$CMT_PROFILE" >&2 \
+  || echo "${0##*/}: starting without a tunnel — queries fail until 'ch-tunnel $CMT_PROFILE' is up." >&2
+
+export CLICKHOUSE_HOST=localhost
+export CLICKHOUSE_PORT="$LOCAL_PORT"
+export CLICKHOUSE_SERVER_HOST_NAME="$("$TUNNEL" --host "$CMT_PROFILE")"
+export CLICKHOUSE_USER="$user"
+export CLICKHOUSE_PASSWORD="$pass"
+export CLICKHOUSE_SECURE="${CLICKHOUSE_SECURE:-true}"
+export CLICKHOUSE_VERIFY="${CLICKHOUSE_VERIFY:-true}"
+[ -n "${CLICKHOUSE_DATABASE:-}" ] && export CLICKHOUSE_DATABASE
+# Read-only by default: this is usually a shared warehouse, and the client is a
+# language model. Server-side grants should enforce it too.
+export CLICKHOUSE_ALLOW_WRITE_ACCESS="${CLICKHOUSE_ALLOW_WRITE_ACCESS:-false}"
+export CLICKHOUSE_ALLOW_DROP="${CLICKHOUSE_ALLOW_DROP:-false}"
+export CHDB_ENABLED=false
+
+# --no-project: the client spawns this from whatever directory it likes, and a
+# surrounding pyproject.toml's requires-python would otherwise veto --python 3.10.
+exec uv run --no-project --with mcp-clickhouse --python 3.10 mcp-clickhouse

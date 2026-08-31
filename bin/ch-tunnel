@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Port-forward to a ClickHouse endpoint reachable only inside a VPC, via AWS SSM.
+#
+# The hop is SSM port-forwarding through a bastion to the endpoint's HTTPS port.
+# AWS credentials are the only thing needed: no SSH and no key in this path.
+#
+# ClickHouse Cloud terminates TLS at a shared endpoint and routes by SNI, so a
+# client pointed at localhost must send the real endpoint hostname. --host prints
+# it; clickhouse-mcp-tunnel passes it as CLICKHOUSE_SERVER_HOST_NAME.
+
+set -uo pipefail
+
+# Resolve our own location through any symlink so lib/ is found when this script
+# is linked into ~/.local/bin.
+_src="$0"
+while [ -L "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  case "$_src" in /*) ;; *) _src="$_dir/$_src" ;; esac
+done
+_self_dir="$(cd -P "$(dirname "$_src")" && pwd)"
+. "$_self_dir/../lib/common.sh"
+
+usage() {
+  cat >&2 <<'USAGE'
+ch-tunnel <profile>              open a tunnel in the foreground (Ctrl-C to close)
+ch-tunnel --ensure <profile>     idempotently open one in the background
+ch-tunnel --status <profile>     up / broken / down
+ch-tunnel --stop <profile>       close a background tunnel
+ch-tunnel --host <profile>       print the endpoint hostname (the SNI to send)
+ch-tunnel --port <profile>       print the local port
+USAGE
+}
+
+# _start <background yes|no> <host>
+_start() {
+  local background="$1" host="$2" bastion params i
+  bastion="$(cmt_bastion_id)" || die "no running bastion for BASTION='$BASTION'"
+  params="{\"host\":[\"${host}\"],\"portNumber\":[\"${REMOTE_PORT}\"],\"localPortNumber\":[\"${LOCAL_PORT}\"]}"
+
+  if [ "$background" = no ]; then
+    echo "tunnelling localhost:${LOCAL_PORT} -> ${host}:${REMOTE_PORT} via ${bastion} (${CMT_PROFILE})"
+    exec env AWS_PROFILE="$AWS_PROFILE" AWS_REGION="$AWS_REGION" aws ssm start-session \
+      --target "$bastion" --document-name AWS-StartPortForwardingSessionToRemoteHost \
+      --parameters "$params"
+  fi
+
+  local log="$CMT_STATE_DIR/$CMT_PROFILE.log" pidfile="$CMT_STATE_DIR/$CMT_PROFILE.pid"
+  env AWS_PROFILE="$AWS_PROFILE" AWS_REGION="$AWS_REGION" nohup aws ssm start-session \
+    --target "$bastion" --document-name AWS-StartPortForwardingSessionToRemoteHost \
+    --parameters "$params" >"$log" 2>&1 &
+  echo $! > "$pidfile"
+  for i in $(seq 1 30); do
+    cmt_healthy "$LOCAL_PORT" "$host" && {
+      echo "ch-tunnel: localhost:${LOCAL_PORT} -> ${host}:${REMOTE_PORT} (${CMT_PROFILE}, ${bastion})" >&2
+      return 0
+    }
+    kill -0 "$(cat "$pidfile")" 2>/dev/null || break
+    sleep 1
+  done
+  echo "ch-tunnel: tunnel did not come up; see $log" >&2
+  return 1
+}
+
+action=open
+case "${1:-}" in
+  --ensure|--status|--stop|--host|--port) action="${1#--}"; shift ;;
+  -h|--help) usage; exit 0 ;;
+  -*) echo "ch-tunnel: unknown option '$1'" >&2; usage; exit 1 ;;
+  "") usage; exit 1 ;;
+esac
+
+cmt_load_profile "${1:?usage: ch-tunnel [--ensure|--status|--stop|--host|--port] <profile>}"
+
+case "$action" in
+  port) echo "$LOCAL_PORT"; exit 0 ;;
+  stop)
+    pidfile="$CMT_STATE_DIR/$CMT_PROFILE.pid"
+    if [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null; then
+      rm -f "$pidfile"; echo "ch-tunnel: stopped ${CMT_PROFILE} tunnel"
+    else
+      echo "ch-tunnel: no background ${CMT_PROFILE} tunnel to stop" >&2; exit 1
+    fi
+    exit 0
+    ;;
+esac
+
+cmt_require_creds || exit 1
+host="$(cmt_remote_host)" || die "could not resolve the endpoint hostname"
+
+case "$action" in
+  host) echo "$host" ;;
+  status)
+    if cmt_healthy "$LOCAL_PORT" "$host"; then
+      echo "up: localhost:${LOCAL_PORT} (${CMT_PROFILE})"
+    elif cmt_listening "$LOCAL_PORT"; then
+      echo "broken: localhost:${LOCAL_PORT} is bound but not reaching ClickHouse (${CMT_PROFILE})"
+      echo "  'ch-tunnel --ensure ${CMT_PROFILE}' will recycle it."
+      exit 1
+    else
+      echo "down: nothing listening on localhost:${LOCAL_PORT} (${CMT_PROFILE})"; exit 1
+    fi
+    ;;
+  open)
+    cmt_healthy "$LOCAL_PORT" "$host" && die "a working tunnel is already open on localhost:${LOCAL_PORT}"
+    cmt_listening "$LOCAL_PORT" && {
+      echo "ch-tunnel: recycling a broken listener on localhost:${LOCAL_PORT}" >&2
+      cmt_kill_stale "$LOCAL_PORT"
+    }
+    _start no "$host"
+    ;;
+  ensure)
+    # Serialise concurrent callers (several MCP servers can start at once) so
+    # only one of them creates the shared tunnel.
+    lock="$CMT_STATE_DIR/$CMT_PROFILE.lock"
+    # A caller killed mid-start leaves the directory behind; two minutes is far
+    # longer than a successful start takes, so an older one is abandoned.
+    [ -d "$lock" ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ] && rmdir "$lock" 2>/dev/null
+    for i in $(seq 1 40); do
+      cmt_healthy "$LOCAL_PORT" "$host" && exit 0
+      if mkdir "$lock" 2>/dev/null; then
+        trap "rmdir '$lock' 2>/dev/null" EXIT
+        cmt_healthy "$LOCAL_PORT" "$host" && exit 0
+        cmt_listening "$LOCAL_PORT" && cmt_kill_stale "$LOCAL_PORT"
+        _start yes "$host"
+        exit $?
+      fi
+      sleep 1
+    done
+    die "timed out waiting on $lock"
+    ;;
+esac
