@@ -72,12 +72,19 @@ esac
 echo "==> profile" >&2
 [ -n "$PROFILE" ] || PROFILE="$(ask 'Profile name (e.g. stg)' stg)"
 FILE="$CONFIG_DIR/$PROFILE.env"
+WRITE_PROFILE=yes
 if [ -f "$FILE" ]; then
   echo "    $FILE already exists:" >&2
   sed 's/^/      /' "$FILE" >&2
-  [ "$(ask 'Overwrite? (y/N)' N)" = y ] || { echo "    keeping existing profile" >&2; exit 0; }
+  # Declining only skips rewriting the profile; registration below still runs, so
+  # the server can be re-pointed without re-entering every detail.
+  [ "$(ask 'Overwrite? (y/N)' N)" = y ] || {
+    echo "    keeping existing profile" >&2
+    WRITE_PROFILE=no
+  }
 fi
 
+if [ "$WRITE_PROFILE" = yes ]; then
 [ -n "$AWS_PROFILE_IN" ] || AWS_PROFILE_IN="$(ask 'AWS profile')"
 [ -n "$AWS_REGION_IN" ]  || AWS_REGION_IN="$(ask 'AWS region' eu-west-1)"
 [ -n "$BASTION_IN" ]     || BASTION_IN="$(ask 'Bastion instance id (i-...) or Name tag')"
@@ -108,10 +115,16 @@ mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR"
 } > "$FILE"
 chmod 600 "$FILE"
 echo "    wrote $FILE" >&2
+fi
+
+# The keychain item name is derived from the profile, so read it back rather than
+# assuming the value this run would have written.
+KEYCHAIN_SERVICE="$(sed -n 's/^KEYCHAIN_SERVICE=//p' "$FILE")"
+: "${KEYCHAIN_SERVICE:=clickhouse-mcp-$PROFILE}"
 
 echo "==> credentials" >&2
-if security find-generic-password -s "clickhouse-mcp-$PROFILE" >/dev/null 2>&1; then
-  echo "    keychain item 'clickhouse-mcp-$PROFILE' already exists" >&2
+if security find-generic-password -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1; then
+  echo "    keychain item '$KEYCHAIN_SERVICE' already exists" >&2
 else
   echo "    store them with: clickhouse-mcp-tunnel --set-credentials $PROFILE" >&2
 fi
