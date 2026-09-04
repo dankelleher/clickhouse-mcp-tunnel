@@ -1,5 +1,7 @@
 # clickhouse-mcp-tunnel
 
+<img width="2040" height="740" alt="image" src="https://github.com/user-attachments/assets/0c3279cd-00d4-4972-b453-aa7ea41a60d0" />
+
 Run the [ClickHouse MCP server](https://github.com/ClickHouse/mcp-clickhouse) against a
 ClickHouse Cloud service that is only reachable over AWS PrivateLink.
 
